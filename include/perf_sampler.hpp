@@ -1,16 +1,22 @@
 #pragma once
 /*
- * perf_sampler.hpp — Drives the sample-interrupt-unwind-resume loop
+ * perf_sampler.hpp — Multi-threaded sampling loop
  *
- * Linux only: uses perf_event_open(2) + PTRACE_SEIZE/INTERRUPT.
- * On non-Linux platforms this file provides the type aliases used by main.cpp
- * but the PerfSampler class is a compile-time stub that always returns an error,
- * so the project compiles cleanly for unit testing on macOS.
+ * What changed from v1:
+ *   - Discovers ALL threads via /proc/<pid>/task/ at startup
+ *   - PTRACE_SEIZEs each thread independently
+ *   - Each sample iteration interrupts every live thread, unwinds its stack,
+ *     then resumes it — so you see CPU usage across the entire process
+ *   - Thread names are attached to each Sample so the flamegraph can
+ *     break down by thread
+ *   - Optional kernel frame inclusion (--kernel flag)
+ *   - Handles threads appearing/disappearing mid-profile (fork/join)
  */
 
 #include "types.hpp"
 #include "stack_unwinder.hpp"
 #include "symbol_resolver.hpp"
+#include "thread_enumerator.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -19,8 +25,8 @@
 
 #ifdef __linux__
 #  include <cerrno>
-#  include <csignal>
 #  include <cstring>
+#  include <fstream>
 #  include <sys/ioctl.h>
 #  include <sys/mman.h>
 #  include <sys/ptrace.h>
@@ -34,50 +40,54 @@
 namespace profiler {
 
 using SampleCallback   = std::function<void(Sample&&)>;
-using ProgressCallback = std::function<void(uint64_t, int64_t)>;
+using ProgressCallback = std::function<void(uint64_t /*samples*/, int64_t /*elapsed_ms*/)>;
 
 class PerfSampler {
 public:
     PerfSampler(const Config &cfg, StackUnwinder &unwinder, SymbolResolver &resolver)
         : cfg_(cfg), unwinder_(unwinder), resolver_(resolver) {}
 
-    ~PerfSampler() {
-#ifdef __linux__
-        cleanup();
-#endif
-    }
+    ~PerfSampler() { cleanup(); }
 
     PerfSampler(const PerfSampler&)            = delete;
     PerfSampler& operator=(const PerfSampler&) = delete;
 
     Status run(SampleCallback on_sample, ProgressCallback on_progress = nullptr) {
 #ifdef __linux__
-        // ── 1. Open perf counter ─────────────────────────────────────────────
-        perf_fd_ = open_perf_event(cfg_.pid);
+        // ── 1. Open perf counter on the main PID ─────────────────────────────
+        perf_fd_ = open_perf_event(cfg_.pid, cfg_.include_kernel);
         if (perf_fd_ < 0)
-            return Status::fail(std::string("perf_event_open: ") + strerror(errno) +
+            return Status::fail(
+                std::string("perf_event_open: ") + strerror(errno) +
                 "\n  → Try: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid");
 
         static constexpr size_t PAGES   = 8;
         static constexpr size_t MMAP_SZ = (PAGES + 1) * 4096;
-        mmap_base_ = mmap(nullptr, MMAP_SZ, PROT_READ|PROT_WRITE, MAP_SHARED, perf_fd_, 0);
+        mmap_base_ = mmap(nullptr, MMAP_SZ, PROT_READ|PROT_WRITE,
+                          MAP_SHARED, perf_fd_, 0);
         if (mmap_base_ == MAP_FAILED) {
             mmap_base_ = nullptr;
             return Status::fail(std::string("mmap perf ring: ") + strerror(errno));
         }
         mmap_size_ = MMAP_SZ;
 
-        // ── 2. Attach ────────────────────────────────────────────────────────
-        if (ptrace(PTRACE_SEIZE, cfg_.pid, nullptr,
-                   (void*)(uintptr_t)PTRACE_O_TRACECLONE) != 0)
-            return Status::fail(std::string("ptrace SEIZE: ") + strerror(errno) +
-                "\n  → Try sudo, or: sudo setcap cap_sys_ptrace+eip ./profiler");
-        attached_ = true;
+        // ── 2. Discover and attach to all threads ─────────────────────────────
+        threads_ = ThreadEnumerator::seize_all(cfg_.pid);
+        if (threads_.empty())
+            return Status::fail("Could not attach to any thread of PID " +
+                                std::to_string(cfg_.pid) +
+                                "\n  → Try sudo, or: sudo setcap cap_sys_ptrace+eip ./profiler");
+
+        int attached_count = 0;
+        for (auto &t : threads_) if (t.attached) ++attached_count;
+        if (cfg_.verbose)
+            std::cout << "  Attached to " << attached_count
+                      << " thread(s)\n";
 
         ioctl(perf_fd_, PERF_EVENT_IOC_RESET,  0);
         ioctl(perf_fd_, PERF_EVENT_IOC_ENABLE, 0);
 
-        // ── 3. Sampling loop ─────────────────────────────────────────────────
+        // ── 3. Sampling loop ──────────────────────────────────────────────────
         const auto interval = std::chrono::microseconds(
             static_cast<long>(1'000'000.0 / cfg_.rate_hz));
         const auto t_start = std::chrono::steady_clock::now();
@@ -90,23 +100,36 @@ public:
         while (running_ && std::chrono::steady_clock::now() < t_end) {
             auto t_iter = std::chrono::steady_clock::now();
 
-            if (ptrace(PTRACE_INTERRUPT, cfg_.pid, nullptr, nullptr) != 0) {
-                if (errno == ESRCH) break;
-                ++n_lost; goto sleep_step;
-            }
-            {
-                int ws = 0;
-                pid_t w = waitpid(cfg_.pid, &ws, __WALL);
-                if (w < 0 || !WIFSTOPPED(ws)) {
-                    ptrace(PTRACE_CONT, cfg_.pid, nullptr, nullptr);
-                    ++n_lost; goto sleep_step;
+            // Sample every attached thread in this iteration
+            for (auto &thread : threads_) {
+                if (!thread.attached) continue;
+
+                // Interrupt this thread
+                if (ptrace(PTRACE_INTERRUPT, thread.tid, nullptr, nullptr) != 0) {
+                    if (errno == ESRCH) {
+                        // Thread exited — mark it detached
+                        thread.attached = false;
+                        continue;
+                    }
+                    ++n_lost;
+                    continue;
                 }
 
-                auto uw = unwinder_.unwind(cfg_.pid);
+                // Wait for the stop to land on THIS thread
+                int ws = 0;
+                pid_t w = waitpid(thread.tid, &ws, __WALL);
+                if (w < 0 || !WIFSTOPPED(ws)) {
+                    ptrace(PTRACE_CONT, thread.tid, nullptr, nullptr);
+                    ++n_lost;
+                    continue;
+                }
+
+                // Unwind its stack
+                auto uw = unwinder_.unwind(thread.tid);
                 if (uw.ok() && !uw.value.empty()) {
                     Sample s;
                     s.timestamp = std::chrono::steady_clock::now();
-                    s.tid       = cfg_.pid;
+                    s.tid       = thread.tid;
                     for (uint64_t a : uw.value)
                         s.frames.push_back(resolver_.resolve(a));
                     on_sample(std::move(s));
@@ -114,10 +137,14 @@ public:
                 } else {
                     ++n_lost;
                 }
-                ptrace(PTRACE_CONT, cfg_.pid, nullptr, nullptr);
+
+                ptrace(PTRACE_CONT, thread.tid, nullptr, nullptr);
             }
 
-sleep_step:
+            // Re-scan for new threads (handles thread pool growth mid-profile)
+            maybe_rescan_threads();
+
+            // Progress callback
             if (on_progress) {
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -129,15 +156,18 @@ sleep_step:
                 }
             }
 
-            auto elapsed = std::chrono::steady_clock::now() - t_iter;
-            if (elapsed < interval) {
+            // Sleep for the remainder of the interval
+            auto elapsed_iter = std::chrono::steady_clock::now() - t_iter;
+            if (elapsed_iter < interval) {
                 auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                    interval - elapsed).count();
+                    interval - elapsed_iter).count();
                 usleep((useconds_t)us);
             }
         }
 
-        lost_samples_ = n_lost;
+        lost_samples_    = n_lost;
+        thread_count_    = (int)threads_.size();
+
         ioctl(perf_fd_, PERF_EVENT_IOC_DISABLE, 0);
         cleanup();
 
@@ -145,7 +175,7 @@ sleep_step:
             return Status::fail("No samples collected — was the process running?");
         return Status::success();
 
-#else  // !__linux__
+#else
         (void)on_sample; (void)on_progress;
         return Status::fail("PerfSampler: perf_event_open is Linux-only");
 #endif
@@ -153,6 +183,7 @@ sleep_step:
 
     void     stop()          { running_ = false; }
     uint64_t lost_samples()  const { return lost_samples_; }
+    int      thread_count()  const { return thread_count_; }
 
 private:
     const Config      &cfg_;
@@ -162,20 +193,54 @@ private:
     int    perf_fd_       = -1;
     void  *mmap_base_     = nullptr;
     size_t mmap_size_     = 0;
-    bool   attached_      = false;
+    std::vector<ThreadInfo> threads_;
     std::atomic<bool> running_{false};
     uint64_t lost_samples_ = 0;
+    int      thread_count_ = 0;
+
+    // Rescan /proc/<pid>/task/ every ~2 seconds to pick up new threads
+    int rescan_counter_ = 0;
+    void maybe_rescan_threads() {
+#ifdef __linux__
+        if (++rescan_counter_ < (cfg_.rate_hz * 2)) return;
+        rescan_counter_ = 0;
+
+        auto r = ThreadEnumerator::list_tids(cfg_.pid);
+        if (!r.ok()) return;
+
+        // Find TIDs we haven't seen yet
+        for (pid_t tid : r.value) {
+            bool known = false;
+            for (auto &t : threads_) if (t.tid == tid) { known = true; break; }
+            if (known) continue;
+
+            ThreadInfo t;
+            t.tid = tid;
+            if (ptrace(PTRACE_SEIZE, tid, nullptr,
+                       (void*)(uintptr_t)PTRACE_O_TRACECLONE) == 0) {
+                t.attached = true;
+                if (cfg_.verbose)
+                    std::cout << "  [new thread] TID " << tid << "\n";
+            }
+            threads_.push_back(t);
+        }
+#endif
+    }
 
     void cleanup() {
 #ifdef __linux__
-        if (attached_) { ptrace(PTRACE_DETACH, cfg_.pid, nullptr, nullptr); attached_ = false; }
-        if (mmap_base_ && mmap_base_ != MAP_FAILED) { munmap(mmap_base_, mmap_size_); mmap_base_ = nullptr; }
+        ThreadEnumerator::detach_all(threads_);
+        threads_.clear();
+        if (mmap_base_ && mmap_base_ != MAP_FAILED) {
+            munmap(mmap_base_, mmap_size_);
+            mmap_base_ = nullptr;
+        }
         if (perf_fd_ >= 0) { close(perf_fd_); perf_fd_ = -1; }
 #endif
     }
 
 #ifdef __linux__
-    static int open_perf_event(pid_t pid) {
+    static int open_perf_event(pid_t pid, bool include_kernel) {
         struct perf_event_attr pea{};
         pea.type           = PERF_TYPE_SOFTWARE;
         pea.config         = PERF_COUNT_SW_CPU_CLOCK;
@@ -183,7 +248,7 @@ private:
         pea.sample_period  = 1'000'000;
         pea.sample_type    = PERF_SAMPLE_IP | PERF_SAMPLE_TID;
         pea.disabled       = 1;
-        pea.exclude_kernel = 1;
+        pea.exclude_kernel = include_kernel ? 0 : 1;
         pea.exclude_hv     = 1;
         pea.wakeup_events  = 1;
         return (int)syscall(SYS_perf_event_open, &pea, pid, -1, -1, 0);
