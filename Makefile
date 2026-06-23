@@ -21,6 +21,18 @@ endif
 
 CXXFLAGS += -fno-omit-frame-pointer
 
+# DWARF unwinding via libunwind-ptrace (works on stripped binaries)
+# Usage: make USE_LIBUNWIND=1
+# Requires: apt install libunwind-dev
+ifeq ($(USE_LIBUNWIND),1)
+  CXXFLAGS += -DUSE_LIBUNWIND
+  LDFLAGS  += -lunwind -lunwind-ptrace -lunwind-x86_64
+  $(info Using DWARF unwinding via libunwind-ptrace)
+else
+  $(info Using frame-pointer unwinding (default))
+  $(info Tip: make USE_LIBUNWIND=1  for stripped binary support)
+endif
+
 # Detect OS
 UNAME := $(shell uname)
 
