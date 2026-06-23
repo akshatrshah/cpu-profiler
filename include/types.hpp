@@ -31,14 +31,15 @@ struct Frame {
 struct Sample {
     std::vector<Frame> frames;  // [0] = innermost (current PC), last = outermost
     std::chrono::steady_clock::time_point timestamp;
-    pid_t tid = 0;
+    pid_t       tid         = 0;
+    std::string thread_name;    // from /proc/<pid>/task/<tid>/comm
 };
 
 // ---------------------------------------------------------------------------
 // Aggregated profile: collapsed stacks → hit counts
 // ---------------------------------------------------------------------------
 //   Key format (Brendan Gregg stackcollapse):
-//     "comm;outer_frame;...;inner_frame"
+//     "comm[thread_name];outer_frame;...;inner_frame"
 using StackKey = std::string;
 
 struct Profile {
@@ -49,19 +50,22 @@ struct Profile {
     std::string target_comm;
     int      rate_hz       = 0;
     int      duration_s    = 0;
+    int      thread_count  = 0;           // number of threads profiled
 };
 
 // ---------------------------------------------------------------------------
 // Configuration (populated by CLI, passed into the engine)
 // ---------------------------------------------------------------------------
 struct Config {
-    pid_t       pid       = -1;
-    int         rate_hz   = 99;
-    int         duration_s = 30;
-    int         max_depth  = 64;
-    std::string output_html  = "flamegraph.html";
-    std::string output_folded;    // empty = auto (<html>.folded)
-    bool        verbose    = false;
+    pid_t       pid            = -1;
+    int         rate_hz        = 99;
+    int         duration_s     = 30;
+    int         max_depth      = 64;
+    std::string output_html    = "flamegraph.html";
+    std::string output_folded;           // empty = auto (<html>.folded)
+    std::string output_pprof;            // empty = skip pprof output
+    bool        include_kernel = false;  // include kernel frames
+    bool        verbose        = false;
 };
 
 // ---------------------------------------------------------------------------
