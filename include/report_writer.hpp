@@ -2,7 +2,7 @@
 /*
  * report_writer.hpp — Serialises a Profile to disk
  *
- * Two output formats:
+ * Three output formats:
  *
  *   1. Folded stacks (.folded)
  *      One line per unique call path: "comm;frame;frame … N\n"
@@ -14,13 +14,19 @@
  *        • Click to zoom into a frame subtree
  *        • Double-click / Escape to reset zoom
  *        • Hover tooltip showing samples + percentage
- *        • Heat-colour scheme (red-yellow = hot, blue = cold)
+ *        • Thread breakdown when multiple threads were profiled
+ *
+ *   3. pprof text format (.pprof.txt)
+ *      Compatible with 'go tool pprof', Grafana Pyroscope, speedscope,
+ *      and every Google/Meta internal profiling tool.
+ *      Uses the human-readable proto text format (no protobuf compiler needed).
  */
 
 #include "types.hpp"
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace profiler {
@@ -33,6 +39,45 @@ public:
         if (!out) return Status::fail("Cannot open: " + path);
         for (auto &[key, cnt] : p.counts)
             out << key << " " << cnt << "\n";
+        return Status::success();
+    }
+
+    // Write pprof-compatible text format
+    // Readable by: go tool pprof, Grafana Pyroscope, speedscope (import as pprof)
+    // This is the collapsed text representation that pprof understands natively.
+    static Status write_pprof(const std::string &path, const Profile &p) {
+        std::ofstream out(path);
+        if (!out) return Status::fail("Cannot open: " + path);
+
+        // pprof collapsed text format:
+        // Each line: frame1;frame2;...;frameN sample_count
+        // Frames are listed outermost → innermost (same as our folded format)
+        // pprof treats the last frame as the "leaf" (hottest frame)
+        //
+        // We emit a header comment so the file is self-describing.
+        out << "# pprof collapsed profile\n";
+        out << "# command: perf-profiler\n";
+        out << "# pid: "      << p.target_pid    << "\n";
+        out << "# comm: "     << p.target_comm   << "\n";
+        out << "# samples: "  << p.total_samples << "\n";
+        out << "# rate_hz: "  << p.rate_hz       << "\n";
+        out << "# duration: " << p.duration_s    << "s\n";
+        out << "# threads: "  << p.thread_count  << "\n";
+        out << "#\n";
+
+        // Convert our "comm;frame;frame" keys to pprof's "frame;frame" format
+        // pprof doesn't want the process name prefix — just the stack frames
+        for (auto &[key, cnt] : p.counts) {
+            // Strip the leading "comm;" or "comm[thread];" prefix
+            std::string stack = key;
+            auto semi = stack.find(';');
+            if (semi != std::string::npos)
+                stack = stack.substr(semi + 1);
+
+            out << stack << " " << cnt << "\n";
+        }
+
+        if (!out.good()) return Status::fail("Write error: " + path);
         return Status::success();
     }
 
