@@ -1,21 +1,8 @@
 #pragma once
-/*
- * thread_enumerator.hpp — Discovers all threads of a process
- *
- * Linux exposes every thread (task) of a process under:
- *   /proc/<pid>/task/<tid>/
- *
- * We read that directory to get all TIDs, then PTRACE_SEIZE each one
- * independently so we can sample them all.
- *
- * Why this matters:
- *   A process with 8 worker threads spending 12% each in the same function
- *   is actually spending 96% of its total CPU there. Without multi-thread
- *   support you'd see 12% and think it's fine.
- */
 
 #include "types.hpp"
 
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -30,13 +17,18 @@
 namespace profiler {
 
 struct ThreadInfo {
-    pid_t tid  = 0;
+    pid_t tid      = 0;
     bool  attached = false;
 };
 
+// Linux exposes all threads of a process under /proc/<pid>/task/<tid>/
+// We enumerate those, seize each one, and sample them all in the main loop.
+//
+// Without this you'd miss CPU work happening on non-main threads entirely.
+// A server with 8 threads each spending 12% in a hot function looks fine
+// per-thread but is actually spending 96% of CPU there.
 class ThreadEnumerator {
 public:
-    // Discover all TIDs for the given PID from /proc/<pid>/task/
     static Result<std::vector<pid_t>> list_tids(pid_t pid) {
 #ifdef __linux__
         std::string task_dir = "/proc/" + std::to_string(pid) + "/task";
@@ -49,30 +41,26 @@ public:
         struct dirent *ent;
         while ((ent = readdir(d)) != nullptr) {
             if (ent->d_name[0] == '.') continue;
-            // Every numeric entry is a TID
-            bool all_digits = true;
+            bool numeric = true;
             for (char *p = ent->d_name; *p; ++p)
-                if (!isdigit((unsigned char)*p)) { all_digits = false; break; }
-            if (!all_digits) continue;
+                if (!isdigit((unsigned char)*p)) { numeric = false; break; }
+            if (!numeric) continue;
             tids.push_back((pid_t)std::stoi(ent->d_name));
         }
         closedir(d);
 
         if (tids.empty())
-            return Result<std::vector<pid_t>>::err("No threads found for PID " +
-                                                    std::to_string(pid));
+            return Result<std::vector<pid_t>>::err(
+                "no threads found for PID " + std::to_string(pid));
         return Result<std::vector<pid_t>>::ok_val(std::move(tids));
 #else
         (void)pid;
-        return Result<std::vector<pid_t>>::err("thread enumeration is Linux-only");
+        return Result<std::vector<pid_t>>::err("Linux-only");
 #endif
     }
 
-    // Attach to all threads of a process.
-    // Returns list of ThreadInfo with attached=true for each that succeeded.
     static std::vector<ThreadInfo> seize_all(pid_t pid) {
         std::vector<ThreadInfo> threads;
-
 #ifdef __linux__
         auto r = list_tids(pid);
         if (!r.ok()) return threads;
@@ -80,18 +68,15 @@ public:
         for (pid_t tid : r.value) {
             ThreadInfo t;
             t.tid = tid;
-            // PTRACE_SEIZE: non-intrusive attach, doesn't stop the thread
             if (ptrace(PTRACE_SEIZE, tid, nullptr,
-                       (void*)(uintptr_t)PTRACE_O_TRACECLONE) == 0) {
+                       (void*)(uintptr_t)PTRACE_O_TRACECLONE) == 0)
                 t.attached = true;
-            }
             threads.push_back(t);
         }
 #endif
         return threads;
     }
 
-    // Detach from all threads
     static void detach_all(const std::vector<ThreadInfo> &threads) {
 #ifdef __linux__
         for (auto &t : threads)
@@ -102,7 +87,6 @@ public:
 #endif
     }
 
-    // Read the thread name from /proc/<pid>/task/<tid>/comm
     static std::string thread_name(pid_t pid, pid_t tid) {
         std::ifstream f("/proc/" + std::to_string(pid) +
                         "/task/" + std::to_string(tid) + "/comm");

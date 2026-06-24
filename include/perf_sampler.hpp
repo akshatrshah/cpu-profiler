@@ -1,16 +1,19 @@
 #pragma once
 /*
- * perf_sampler.hpp — Multi-threaded sampling loop
+ * perf_sampler.hpp
  *
- * What changed from v1:
- *   - Discovers ALL threads via /proc/<pid>/task/ at startup
- *   - PTRACE_SEIZEs each thread independently
- *   - Each sample iteration interrupts every live thread, unwinds its stack,
- *     then resumes it — so you see CPU usage across the entire process
- *   - Thread names are attached to each Sample so the flamegraph can
- *     break down by thread
- *   - Optional kernel frame inclusion (--kernel flag)
- *   - Handles threads appearing/disappearing mid-profile (fork/join)
+ * The main sampling loop. Opens a perf_event_open counter on the target,
+ * discovers all its threads, and every 1/rate seconds:
+ *   - interrupts each thread with PTRACE_INTERRUPT
+ *   - unwinds its stack
+ *   - resumes it
+ *   - calls the sample callback with the result
+ *
+ * Rescans /proc/<pid>/task/ periodically to pick up threads that spawn
+ * after we start (common in thread pools).
+ *
+ * The --kernel flag maps to exclude_kernel in the perf_event_attr,
+ * so kernel frames only show up when explicitly requested.
  */
 
 #include "types.hpp"

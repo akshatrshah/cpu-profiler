@@ -1,15 +1,21 @@
 #pragma once
 /*
- * symbol_resolver.hpp — Maps raw virtual addresses → human-readable symbols
+ * symbol_resolver.hpp
  *
- * Portable compilation:
- *   On Linux  → parses /proc/<pid>/maps + reads ELF .symtab directly (no libelf).
- *   On macOS  → stub that always returns the hex address.
- *     (macOS uses Mach-O + dtrace/DTrace for profiling; this profiler's
- *      ptrace/perf_event engine is Linux-only anyway.)
+ * Turns raw virtual addresses from the target process into function names.
  *
- * All unit-testable logic (MapRegion, ElfSym, binary-search, etc.) compiles
- * on every platform so the test suite runs anywhere.
+ * Steps:
+ *   1. Parse /proc/<pid>/maps to find which binary/DSO owns a given address
+ *   2. Compute the file-relative offset within that binary
+ *   3. Read the ELF .symtab or .dynsym section directly (no libelf needed)
+ *      and binary-search for the function that contains that offset
+ *
+ * Falls back to "binary+0xoffset" if the binary is stripped, and "0xaddr"
+ * if the address isn't in any mapped region.
+ *
+ * macOS note: /proc doesn't exist on macOS so the map loading is stubbed out.
+ * The ELF parsing code still compiles because we define the structs ourselves
+ * when elf.h isn't available. The test suite runs fine on macOS.
  */
 
 #include "types.hpp"
@@ -27,11 +33,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// ELF types — Linux ships elf.h; on macOS we define only what we need.
+// Linux ships elf.h. On macOS we define the ELF64 structs we need directly
+// so the code compiles and the unit tests can run there too.
 #ifdef __linux__
 #  include <elf.h>
 #else
-// ── Minimal ELF64 definitions for non-Linux builds ──────────────────────────
 #  include <cstdint>
 using Elf64_Half  = uint16_t;
 using Elf64_Word  = uint32_t;
@@ -77,34 +83,27 @@ struct Elf64_Sym {
 
 namespace profiler {
 
-// ---------------------------------------------------------------------------
-// One entry from /proc/<pid>/maps  (or a synthetic entry in tests)
-// ---------------------------------------------------------------------------
+// one region from /proc/<pid>/maps
 struct MapRegion {
     uint64_t    start  = 0;
     uint64_t    end    = 0;
-    uint64_t    offset = 0;   // file offset of mapping start
+    uint64_t    offset = 0;  // file offset where this mapping starts
     std::string path;
     bool        exec   = false;
 };
 
-// ---------------------------------------------------------------------------
-// Lightweight ELF symbol extracted from .symtab / .dynsym
-// ---------------------------------------------------------------------------
+// one function entry from ELF .symtab or .dynsym
 struct ElfSym {
     uint64_t    addr = 0;
     uint64_t    size = 0;
     std::string name;
 };
 
-// ---------------------------------------------------------------------------
-// SymbolResolver
-// ---------------------------------------------------------------------------
 class SymbolResolver {
 public:
     explicit SymbolResolver(pid_t pid) : pid_(pid) {}
 
-    // Resolve a virtual address → Frame.  Never throws.
+    // resolve an address to a Frame — never throws, always returns something
     Frame resolve(uint64_t addr) {
         Frame f;
         f.address = addr;
@@ -166,8 +165,7 @@ private:
             maps_.push_back(r);
         }
 #else
-        // macOS: /proc doesn't exist.  Symbol resolution is unavailable;
-        // the profiler engine itself also won't run on macOS.
+        // macOS has no /proc — stubs out cleanly, tests still run
         (void)pid_;
 #endif
 
@@ -185,7 +183,6 @@ private:
         return nullptr;
     }
 
-    // ── ELF symbol lookup ────────────────────────────────────────────────────
     std::string lookup_elf_symbol(const std::string &path, uint64_t file_offset) {
         auto &table = get_syms(path);
         if (table.empty()) return {};
@@ -218,9 +215,8 @@ private:
         return table;
     }
 
-    // Reads ELF .symtab / .dynsym from a file on disk.
-    // The ELF struct definitions above mean this compiles on macOS too,
-    // but it will simply return nothing (macOS binaries are Mach-O, not ELF).
+    // mmap the binary and walk its section headers looking for .symtab / .dynsym
+    // returns nothing if the binary is stripped or isn't ELF64
     static void load_elf_syms(const std::string &path, std::vector<ElfSym> &out) {
         int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) return;

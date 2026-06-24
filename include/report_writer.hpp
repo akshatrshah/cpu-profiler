@@ -1,25 +1,18 @@
 #pragma once
 /*
- * report_writer.hpp — Serialises a Profile to disk
+ * report_writer.hpp
  *
- * Three output formats:
+ * Writes the profile to disk in three formats:
  *
- *   1. Folded stacks (.folded)
- *      One line per unique call path: "comm;frame;frame … N\n"
- *      Compatible with Brendan Gregg's flamegraph.pl and speedscope.
+ *   .folded    — one line per call path, space-separated count at the end.
+ *                this is the stackcollapse format from Brendan Gregg's toolchain.
+ *                works directly with flamegraph.pl and speedscope.
  *
- *   2. Self-contained interactive HTML flamegraph
- *      Single file — no CDN, no external JS.  Opens in any modern browser.
- *      Canvas-based renderer with:
- *        • Click to zoom into a frame subtree
- *        • Double-click / Escape to reset zoom
- *        • Hover tooltip showing samples + percentage
- *        • Thread breakdown when multiple threads were profiled
+ *   .html      — self-contained flamegraph, no CDN, no dependencies.
+ *                canvas-based renderer, click to zoom, hover for percentages.
  *
- *   3. pprof text format (.pprof.txt)
- *      Compatible with 'go tool pprof', Grafana Pyroscope, speedscope,
- *      and every Google/Meta internal profiling tool.
- *      Uses the human-readable proto text format (no protobuf compiler needed).
+ *   .pprof.txt — collapsed text format that go tool pprof and Grafana Pyroscope
+ *                understand natively. no protobuf compiler needed.
  */
 
 #include "types.hpp"

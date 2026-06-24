@@ -1,13 +1,4 @@
 #pragma once
-/*
- * aggregator.hpp — Converts raw Sample events into a Profile
- *
- * Key format:  "comm[thread_name];outermost;...;innermost"
- *
- * The thread name in brackets lets you distinguish work done by different
- * threads in the flamegraph. If there's only one thread, or if all threads
- * have the same name, the brackets are omitted to keep keys readable.
- */
 
 #include "types.hpp"
 #include <string>
@@ -15,26 +6,28 @@
 
 namespace profiler {
 
+// Takes raw samples and accumulates hit counts per unique call path.
+//
+// Key format: "comm[thread];outermost_frame;...;innermost_frame"
+// Thread name is included only when it differs from the process name,
+// so single-threaded profiles stay clean.
 class Aggregator {
 public:
     explicit Aggregator(std::string comm) : comm_(std::move(comm)) {}
 
     void add(const Sample &s) {
-        // Build key:  comm[thread_name];outermost;...;innermost
         std::string key = comm_;
 
-        // Include thread name if it differs from the process name
         if (!s.thread_name.empty() && s.thread_name != comm_) {
             key += '[';
             key += s.thread_name;
             key += ']';
         }
 
-        // Track which threads we have seen
         if (!s.thread_name.empty())
             seen_threads_.insert(s.thread_name);
 
-        // Append frames outermost → innermost
+        // outermost frame first — that's what flamegraph.pl expects
         for (int i = (int)s.frames.size() - 1; i >= 0; --i) {
             key += ';';
             const auto &f = s.frames[i];

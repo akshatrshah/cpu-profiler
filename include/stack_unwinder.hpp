@@ -1,22 +1,4 @@
 #pragma once
-/*
- * stack_unwinder.hpp — Unwinds the call stack of a stopped process
- *
- * Two strategies, chosen at compile time:
- *
- *   1. DWARF unwinding via libunwind-ptrace  (USE_LIBUNWIND=1)
- *      Works on any binary regardless of compiler flags.
- *      Reads .eh_frame / .debug_frame from the binary on disk.
- *      Install: apt install libunwind-dev
- *      Build:   make USE_LIBUNWIND=1
- *
- *   2. Frame-pointer walk  (default, zero dependencies)
- *      Requires target compiled with -fno-omit-frame-pointer.
- *      Fast, simple, works perfectly for debug/profiling builds.
- *
- * On non-Linux platforms both strategies compile as stubs so the
- * test suite runs everywhere.
- */
 
 #include "types.hpp"
 
@@ -28,7 +10,6 @@
 #  include <sys/ptrace.h>
 #  include <sys/uio.h>
 #  include <sys/user.h>
-
 #  ifdef USE_LIBUNWIND
 #    define UNW_LOCAL_ONLY
 #    include <libunwind-ptrace.h>
@@ -37,7 +18,6 @@
 
 namespace profiler {
 
-// Which strategy is active — reported in verbose output
 inline const char* unwind_method() {
 #ifdef USE_LIBUNWIND
     return "DWARF (libunwind-ptrace)";
@@ -46,20 +26,25 @@ inline const char* unwind_method() {
 #endif
 }
 
+// Unwinds the call stack of a ptrace-stopped process.
+//
+// Two strategies:
+//   default       — frame pointer walk. Fast, zero deps, but requires the target
+//                   was compiled with -fno-omit-frame-pointer.
+//   USE_LIBUNWIND — reads .eh_frame via libunwind-ptrace. Works on any binary
+//                   including fully stripped ones. Needs: apt install libunwind-dev
+//                   Build with: make USE_LIBUNWIND=1
 class StackUnwinder {
 public:
     explicit StackUnwinder(int max_depth = 64) : max_depth_(max_depth) {}
 
-    // Unwind stopped process `pid`. Must be in ptrace-stop.
     Result<std::vector<uint64_t>> unwind(pid_t pid) const {
 #ifdef __linux__
-
 #  ifdef USE_LIBUNWIND
         return unwind_dwarf(pid);
 #  else
         return unwind_fp(pid);
 #  endif
-
 #else
         (void)pid;
         return Result<std::vector<uint64_t>>::err("ptrace is Linux-only");
@@ -74,17 +59,14 @@ private:
 
 #ifdef __linux__
 
-    // ── Strategy 1: DWARF via libunwind-ptrace ────────────────────────────
 #  ifdef USE_LIBUNWIND
     Result<std::vector<uint64_t>> unwind_dwarf(pid_t pid) const {
         std::vector<uint64_t> addrs;
 
-        // Create a remote address space for the target process
         unw_addr_space_t as = unw_create_addr_space(&_UPT_accessors, __BYTE_ORDER__);
         if (!as)
             return Result<std::vector<uint64_t>>::err("unw_create_addr_space failed");
 
-        // _UPT_create sets up ptrace-based accessors for this PID
         void *ui = _UPT_create(pid);
         if (!ui) {
             unw_destroy_addr_space(as);
@@ -114,9 +96,8 @@ private:
             return Result<std::vector<uint64_t>>::err("DWARF unwind: no frames");
         return Result<std::vector<uint64_t>>::ok_val(std::move(addrs));
     }
-#  endif // USE_LIBUNWIND
+#  endif
 
-    // ── Strategy 2: Frame-pointer walk ────────────────────────────────────
     Result<std::vector<uint64_t>> unwind_fp(pid_t pid) const {
         std::vector<uint64_t> addrs;
 
@@ -135,7 +116,7 @@ private:
             return Result<std::vector<uint64_t>>::err(
                 std::string("PTRACE_GETREGSET: ") + strerror(errno));
         uint64_t ip = regs.pc;
-        uint64_t bp = regs.regs[29]; // x29 = frame pointer
+        uint64_t bp = regs.regs[29];
 #  else
 #    error "unsupported architecture"
 #  endif
@@ -145,7 +126,7 @@ private:
 
         uint64_t prev_bp = 0;
         for (int depth = 1; depth < max_depth_ && bp != 0 && bp != prev_bp; ++depth) {
-            // Each frame: [bp+0] = saved_bp, [bp+8] = return_address
+            // [bp+0] = saved frame pointer, [bp+8] = return address
             uint64_t buf[2] = {0, 0};
             struct iovec local_iov  { buf,                          sizeof(buf) };
             struct iovec remote_iov { reinterpret_cast<void*>(bp),  sizeof(buf) };
@@ -166,7 +147,7 @@ private:
         return Result<std::vector<uint64_t>>::ok_val(std::move(addrs));
     }
 
-#endif // __linux__
+#endif
 };
 
 } // namespace profiler
